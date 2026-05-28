@@ -196,10 +196,6 @@ Esse script auxilia a verificar o comportamento da captura quando ha falha tempo
 - O detector HOG pode ter dificuldade com pessoas pequenas, parcialmente ocultas ou em angulos desfavoraveis.
 - O rastreamento por centroide e simples e pode trocar IDs em cenas muito cheias.
 
-## Uso de IA generativa
-
-A IA generativa foi utilizada como apoio na organizacao da documentacao e revisao textual do projeto. O codigo e a logica do sistema devem ser analisados, compreendidos e ajustados pela equipe antes da apresentacao.
-
 ## Licenca
 
 Este projeto esta disponibilizado sob a licenca MIT. Consulte o arquivo `LICENSE` para mais detalhes.
