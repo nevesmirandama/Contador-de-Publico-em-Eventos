@@ -1,50 +1,85 @@
-# Grupo 5 - Contador de Público em Eventos
+# Contador de Publico em Eventos
 
-Projeto inicial em Python + OpenCV para a trilha **Contador de Público em Eventos**.
+Sistema de contagem automatica de publico em eventos usando visao computacional com Python e OpenCV.
+
+O projeto identifica pessoas ou objetos em movimento em uma cena, acompanha seus centroides ao longo dos frames e contabiliza entradas e saidas quando ha cruzamento de uma linha virtual definida pelo usuario.
 
 ## Integrantes
-- Jairo Galvão
+
+- Jairo Galvao
 - Adriel Neves
 
-## O que este MVP faz
-- abre webcam ou vídeo
-- permite definir uma linha virtual por clique e arraste
-- detecta objetos em movimento com **MOG2** ou **KNN**
-- limpa ruído com operações morfológicas
-- cria **bounding boxes** e centróides
-- rastreia objetos por ID com associação simples por centróide
-- conta cruzamentos em duas direções
-- exibe painel com **Entradas**, **Saídas**, **Fluxo/min** e **FPS**
-- salva eventos em CSV com timestamp, direção e ID do tracker
+## Objetivo
 
-## Estrutura
+O objetivo do sistema e auxiliar a estimativa de fluxo de pessoas em ambientes de eventos, como corredores, portas de auditorios, salas e areas de circulacao.
+
+A aplicacao permite processar imagens de webcam ou videos gravados, exibir a contagem em tempo real e registrar os eventos detectados em arquivo CSV para analise posterior.
+
+## Funcionalidades
+
+- Captura de video por webcam ou arquivo local.
+- Definicao de linha virtual por mouse ou por parametros no terminal.
+- Deteccao de movimento com subtracao de fundo MOG2 ou KNN.
+- Deteccao de pessoas com HOG do OpenCV.
+- Modo hibrido combinando deteccao de pessoas e deteccao de movimento.
+- Limpeza da mascara com operacoes morfologicas.
+- Geracao de bounding boxes e centroides.
+- Rastreamento simples por associacao de centroides.
+- Contagem de cruzamentos em duas direcoes: entrada e saida.
+- Painel em tempo real com entradas, saidas, fluxo por minuto, FPS e detector usado.
+- Exportacao dos eventos para CSV com timestamp, direcao, ID do rastreador e posicao do centroide.
+- Salvamento manual de frames durante a execucao.
+
+## Como o sistema funciona
+
+1. O video e aberto a partir da webcam ou de um arquivo informado pelo usuario.
+2. O usuario define uma linha de contagem na primeira imagem do video.
+3. Cada frame passa por uma etapa de deteccao, que pode usar movimento, HOG ou modo hibrido.
+4. As deteccoes sao convertidas em caixas delimitadoras e centroides.
+5. O rastreador associa as deteccoes atuais aos objetos acompanhados anteriormente.
+6. Quando um centroide cruza a linha virtual, o sistema registra entrada ou saida.
+7. Os resultados aparecem na tela e tambem sao salvos no arquivo `results/events.csv`.
+
+## Estrutura do projeto
+
 ```text
-publico_eventos_grupo5/
-├── README.md
-├── LICENSE
-├── requirements.txt
-├── .gitignore
-├── src/
-│   ├── main.py
-│   ├── pipeline/
-│   │   ├── preprocessing.py
-│   │   ├── detection.py
-│   │   ├── tracking.py
-│   │   └── counter.py
-│   ├── ui/
-│   │   └── line_selector.py
-│   └── utils/
-│       └── csv_logger.py
-├── tests/
-│   ├── test_fps.py
-│   └── test_failover.py
-├── assets/
-│   └── samples/
-└── results/
+Version_2/
+|-- README.md
+|-- LICENSE
+|-- requirements.txt
+|-- comando.txt
+|-- assets/
+|-- results/
+|   `-- events.csv
+|-- src/
+|   |-- main.py
+|   |-- pipeline/
+|   |   |-- preprocessing.py
+|   |   |-- detection.py
+|   |   |-- tracking.py
+|   |   `-- counter.py
+|   |-- ui/
+|   |   `-- line_selector.py
+|   `-- utils/
+|       `-- csv_logger.py
+`-- tests/
+    |-- test_fps.py
+    `-- test_failover.py
 ```
 
-## Instalação
+## Tecnologias utilizadas
+
+- Python 3
+- OpenCV
+- NumPy
+- Subtracao de fundo MOG2/KNN
+- Detector HOG para pessoas
+- Rastreamento por centroide
+
+## Instalacao
+
 ### Windows
+
 ```bash
 py -m venv venv
 venv\Scripts\activate
@@ -52,6 +87,7 @@ pip install -r requirements.txt
 ```
 
 ### Linux
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -59,57 +95,111 @@ pip install -r requirements.txt
 ```
 
 ## Como executar
-### Webcam
+
+### Usando webcam
+
 ```bash
 python src/main.py --source 0
 ```
 
-### Vídeo gravado
+### Usando video gravado
+
 ```bash
 python src/main.py --source caminho/do/video.mp4
 ```
 
-### Usando KNN em vez de MOG2
+### Usando KNN como subtrator de fundo
+
 ```bash
 python src/main.py --source 0 --bg knn
 ```
 
-### Definindo a linha por parâmetros
+### Usando o detector HOG
+
+```bash
+python src/main.py --source 0 --detector hog
+```
+
+### Usando o modo hibrido
+
+```bash
+python src/main.py --source 0 --detector hybrid
+```
+
+### Definindo a linha por parametros
+
 ```bash
 python src/main.py --source 0 --line 100 300 550 300
 ```
 
-## Controles
-- **q**: sair
-- **r**: redefinir linha
-- **s**: salvar frame atual em `results/`
+## Parametros principais
 
-## Observações
-- Na primeira execução sem `--line`, o sistema abre uma tela para você desenhar a linha com o mouse.
-- Para a SECOMP, vale muito usar **vídeos próprios de corredores/porta de auditório**, porque o enunciado valoriza isso.
-- Este projeto é um **ponto de partida funcional**, não a versão final do trabalho.
+| Parametro | Descricao | Padrao |
+|---|---|---|
+| `--source` | Fonte do video. Use `0` para webcam ou informe o caminho de um arquivo. | `0` |
+| `--bg` | Algoritmo de subtracao de fundo. Aceita `mog2` ou `knn`. | `mog2` |
+| `--detector` | Modo de deteccao. Aceita `motion`, `hog` ou `hybrid`. | `motion` |
+| `--min-area` | Area minima para aceitar um objeto detectado por movimento. | `1800` |
+| `--max-distance` | Distancia maxima para associar centroides ao mesmo rastreador. | `90.0` |
+| `--max-misses` | Numero maximo de frames sem deteccao antes de remover um rastreador. | `25` |
+| `--csv` | Caminho do arquivo CSV de eventos. | `results/events.csv` |
+| `--line` | Coordenadas da linha fixa no formato `x1 y1 x2 y2`. | manual |
+| `--save-frame-dir` | Pasta para salvar frames durante a execucao. | `results` |
 
-## Uso de IA Generativa
-- apoio na documentação inicial do README do projeto
+## Controles durante a execucao
 
-Todo o código deve ser lido, entendido e ajustado manualmente pela equipe antes da apresentação.
+- `Q`: encerra a aplicacao.
+- `R`: redefine a linha de contagem.
+- `S`: salva o frame atual na pasta configurada.
 
-## Próximos passos sugeridos
-1. calibrar `min-area`, `max-distance` e morfologia
-2. melhorar o rastreamento para reduzir dupla contagem
-3. implementar scripts completos dos 5 protocolos
-4. gerar tabelas e gráficos para o artigo
-5. preparar pôster e artigo SBC
+## Saida CSV
 
+Os eventos detectados sao salvos em `results/events.csv`.
 
-## Modos de detecção
-- **motion**: usa apenas movimento (mais sensível, porém pode contar sombras e partes do corpo)
-- **hog**: usa o detector de pessoas do OpenCV
-- **hybrid**: combina detector de pessoas + movimento (recomendado)
+Formato das colunas:
 
-### Exemplos
-```bash
-python src/main.py --source 0 --detector hybrid
-python src/main.py --source 0 --detector hog
-python src/main.py --source video.mp4 --detector hybrid
+```csv
+timestamp,direction,tracker_id,cx,cy
 ```
+
+Exemplo:
+
+```csv
+2026-05-10T19:40:12,entrada,3,421,250
+2026-05-10T19:40:18,saida,4,390,248
+```
+
+## Scripts auxiliares
+
+O projeto possui dois scripts auxiliares na pasta `tests/`.
+
+### Medicao de FPS
+
+```bash
+python tests/test_fps.py
+```
+
+Esse script captura frames da fonte de video e exibe FPS medio, minimo, maximo e desvio-padrao.
+
+### Teste de tolerancia a falhas
+
+```bash
+python tests/test_failover.py
+```
+
+Esse script auxilia a verificar o comportamento da captura quando ha falha temporaria da webcam.
+
+## Limitacoes
+
+- A precisao depende da iluminacao, posicionamento da camera, oclusoes e calibracao da linha.
+- O modo baseado apenas em movimento pode contar sombras ou partes do corpo em alguns cenarios.
+- O detector HOG pode ter dificuldade com pessoas pequenas, parcialmente ocultas ou em angulos desfavoraveis.
+- O rastreamento por centroide e simples e pode trocar IDs em cenas muito cheias.
+
+## Uso de IA generativa
+
+A IA generativa foi utilizada como apoio na organizacao da documentacao e revisao textual do projeto. O codigo e a logica do sistema devem ser analisados, compreendidos e ajustados pela equipe antes da apresentacao.
+
+## Licenca
+
+Este projeto esta disponibilizado sob a licenca MIT. Consulte o arquivo `LICENSE` para mais detalhes.
