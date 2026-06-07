@@ -1,173 +1,378 @@
-from __future__ import annotations
-
-import argparse
-import time
-from pathlib import Path
-
 import cv2
+import numpy as np
+from ultralytics import YOLO
 
-from pipeline.counter import LineCounter
-from pipeline.detection import (
-    combine_person_detections,
-    create_hog_detector,
-    detect_moving_objects,
-    detect_people_hog,
-)
-from pipeline.preprocessing import create_background_subtractor, preprocess_mask
-from pipeline.tracking import CentroidTracker
-from ui.line_selector import LineSelector
-from utils.csv_logger import CsvEventLogger
+# =====================================================
+# CONFIGURAÇÕES
+# =====================================================
+CAMERA_INDEX = 0
 
+# Modelo de pose.
+# Se quiser testar outros modelos, pode trocar por:
+# "yolo11n-pose.pt" ou "yolo26n-pose.pt", dependendo da sua versão do Ultralytics.
+MODEL_NAME = "yolov8n-pose.pt"
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Grupo 5 - Contador de Público em Eventos")
-    parser.add_argument("--source", default="0", help="0 para webcam ou caminho para arquivo de vídeo")
-    parser.add_argument("--bg", default="mog2", choices=["mog2", "knn"], help="Algoritmo de subtração de fundo")
-    parser.add_argument("--detector", default="motion", choices=["motion", "hog", "hybrid"],
-                        help="motion=movimento, hog=pessoa, hybrid=pessoa+movimento")
-    parser.add_argument("--min-area", type=int, default=1800, help="Área mínima do contorno")
-    parser.add_argument("--max-distance", type=float, default=90.0, help="Distância máxima entre centróides")
-    parser.add_argument("--max-misses", type=int, default=25, help="Máximo de frames sem detecção")
-    parser.add_argument("--csv", default="results/events.csv", help="Caminho do CSV")
-    parser.add_argument("--line", nargs=4, type=int, metavar=("X1", "Y1", "X2", "Y2"), help="Linha fixa: x1 y1 x2 y2")
-    parser.add_argument("--save-frame-dir", default="results", help="Diretório para salvar frames")
-    return parser.parse_args()
+CONFIDENCE = 0.35
+KEYPOINT_CONFIDENCE = 0.35
 
+# Quantos frames uma pessoa pode sumir antes de ser considerada fora do ambiente.
+# Isso ajuda quando duas pessoas ficam muito próximas e o detector perde uma por instantes.
+MAX_FRAMES_DESAPARECIDO = 20
 
-def open_capture(source: str):
-    return cv2.VideoCapture(0 if source == "0" else source)
+WINDOW_NAME = "Contador por Cabeca e Ombros"
 
+# =====================================================
+# ÍNDICES DOS KEYPOINTS COCO
+# =====================================================
+NOSE = 0
+LEFT_EYE = 1
+RIGHT_EYE = 2
+LEFT_EAR = 3
+RIGHT_EAR = 4
+LEFT_SHOULDER = 5
+RIGHT_SHOULDER = 6
 
-def draw_dashboard(frame, counter: LineCounter, fps: float, flow_per_min: float, detector_name: str):
-    h, _w = frame.shape[:2]
-    cv2.rectangle(frame, (10, 10), (355, 155), (0, 0, 0), -1)
-    cv2.rectangle(frame, (10, 10), (355, 155), (0, 255, 0), 2)
-    cv2.putText(frame, f"Detector: {detector_name}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-    cv2.putText(frame, f"Entradas: {counter.entries}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    cv2.putText(frame, f"Saidas: {counter.exits}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-    cv2.putText(frame, f"Fluxo/min: {flow_per_min:.1f}", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(frame, f"FPS: {fps:.1f}", (215, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(frame, "Q=sair  R=linha  S=salvar frame", (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+# =====================================================
+# FUNÇÕES AUXILIARES
+# =====================================================
+def ponto_valido(kpts, idx, min_conf=KEYPOINT_CONFIDENCE):
+    """
+    Verifica se um keypoint existe e tem confiança suficiente.
+    Formato esperado do keypoint: [x, y, conf]
+    """
+    if kpts is None:
+        return False
 
+    if idx >= len(kpts):
+        return False
 
-def get_boxes(frame, mask, detector_mode: str, hog, min_area: int):
-    if detector_mode == "motion":
-        return detect_moving_objects(mask, min_area=min_area)
-    if detector_mode == "hog":
-        return detect_people_hog(frame, hog)
-    return combine_person_detections(frame, mask, hog, min_area=min_area)
+    x, y, conf = kpts[idx]
 
+    if conf < min_conf:
+        return False
 
-def warmup_subtractor(cap, subtractor, frames: int = 20):
-    # queima os primeiros frames para o fundo não nascer todo branco
-    for _ in range(frames):
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            break
-        subtractor.apply(frame)
+    if x <= 0 or y <= 0:
+        return False
+
+    return True
 
 
-def main():
-    args = parse_args()
-    cap = open_capture(args.source)
-    if not cap.isOpened():
-        print("Erro: nao foi possivel abrir a fonte de video.")
-        return
+def obter_ponto_cabeca(kpts):
+    """
+    Retorna o melhor ponto para representar a cabeça.
+    Prioridade:
+    1. Nariz
+    2. Média dos olhos
+    3. Média das orelhas
+    """
+    if ponto_valido(kpts, NOSE):
+        x, y, _ = kpts[NOSE]
+        return int(x), int(y)
 
-    ok, first_frame = cap.read()
-    if not ok or first_frame is None:
-        print("Erro: nao foi possivel ler o primeiro frame.")
-        cap.release()
-        return
+    olhos = []
+    for idx in [LEFT_EYE, RIGHT_EYE]:
+        if ponto_valido(kpts, idx):
+            x, y, _ = kpts[idx]
+            olhos.append((x, y))
 
-    if args.line:
-        p1 = (args.line[0], args.line[1])
-        p2 = (args.line[2], args.line[3])
-    else:
-        p1, p2 = LineSelector().select(first_frame)
+    if len(olhos) > 0:
+        x = int(np.mean([p[0] for p in olhos]))
+        y = int(np.mean([p[1] for p in olhos]))
+        return x, y
 
-    subtractor = create_background_subtractor(args.bg)
-    hog = create_hog_detector()
-    # volta para o início se for arquivo; em webcam segue do ponto atual
-    if args.source != "0":
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    warmup_subtractor(cap, subtractor, frames=12)
+    orelhas = []
+    for idx in [LEFT_EAR, RIGHT_EAR]:
+        if ponto_valido(kpts, idx):
+            x, y, _ = kpts[idx]
+            orelhas.append((x, y))
 
-    tracker = CentroidTracker(max_distance=args.max_distance, max_misses=args.max_misses)
-    counter = LineCounter(p1, p2)
-    logger = CsvEventLogger(args.csv)
+    if len(orelhas) > 0:
+        x = int(np.mean([p[0] for p in orelhas]))
+        y = int(np.mean([p[1] for p in orelhas]))
+        return x, y
 
-    save_dir = Path(args.save_frame_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    return None
 
-    frame_idx = 0
-    start_time = time.time()
-    last_time = time.time()
-    fps = 0.0
-    last_mask = None
 
-    while True:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            print("Aviso: frame nao recebido. Encerrando captura.")
-            break
+def validar_formato_cabeca_ombros(kpts):
+    """
+    Valida se a pessoa tem pelo menos:
+    - cabeça detectada;
+    - ombro esquerdo;
+    - ombro direito.
 
-        frame_idx += 1
-        if args.detector == "hog":
-            mask = None
-            last_mask = None
-            boxes = get_boxes(frame, None, args.detector, hog, args.min_area)
-        else:
-            mask = preprocess_mask(frame, subtractor)
-            last_mask = mask
-            boxes = get_boxes(frame, mask, args.detector, hog, args.min_area)
-        tracks = tracker.update(boxes)
+    Também valida se os ombros estão abaixo da cabeça.
+    Isso reduz falsos positivos.
+    """
+    cabeca = obter_ponto_cabeca(kpts)
 
-        for track in tracks.values():
-            event = counter.check_crossing(track, frame_idx)
-            if event:
-                logger.log(event.direction, event.track_id, event.centroid)
+    if cabeca is None:
+        return False, None, None, None
 
-        cv2.line(frame, p1, p2, (0, 255, 255), 2)
+    if not ponto_valido(kpts, LEFT_SHOULDER):
+        return False, None, None, None
 
-        for track in tracks.values():
-            x, y, w, h = track.bbox
-            cx, cy = track.centroid
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
-            cv2.putText(frame, f"Movimento {track.track_id}", (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    if not ponto_valido(kpts, RIGHT_SHOULDER):
+        return False, None, None, None
 
-        now = time.time()
-        delta = now - last_time
-        if delta > 0:
-            fps = 1.0 / delta
-        last_time = now
+    head_x, head_y = cabeca
 
-        elapsed_min = max((now - start_time) / 60.0, 1e-6)
-        flow_per_min = (counter.entries + counter.exits) / elapsed_min
-        draw_dashboard(frame, counter, fps, flow_per_min, args.detector)
+    lx, ly, _ = kpts[LEFT_SHOULDER]
+    rx, ry, _ = kpts[RIGHT_SHOULDER]
 
-        cv2.imshow("Grupo 5 - Contador de Publico", frame)
-        if last_mask is not None:
-            cv2.imshow("Mascara", last_mask)
+    lx, ly = int(lx), int(ly)
+    rx, ry = int(rx), int(ry)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), ord("Q")):
-            break
-        elif key in (ord("r"), ord("R")):
-            ok2, current = cap.read()
-            if ok2 and current is not None:
-                p1, p2 = LineSelector().select(current)
-                counter = LineCounter(p1, p2)
-        elif key in (ord("s"), ord("S")):
-            out_path = save_dir / f"frame_{frame_idx}.png"
-            cv2.imwrite(str(out_path), frame)
-            print(f"Frame salvo em: {out_path}")
+    # Ombros devem estar abaixo da cabeça.
+    if ly <= head_y or ry <= head_y:
+        return False, None, None, None
 
+    largura_ombros = abs(rx - lx)
+
+    # Evita aceitar detecções deformadas demais.
+    if largura_ombros < 20:
+        return False, None, None, None
+
+    # Centro entre cabeça e ombros.
+    centro_x = int((head_x + lx + rx) / 3)
+    centro_y = int((head_y + ly + ry) / 3)
+
+    return True, (head_x, head_y), (lx, ly), (rx, ry), (centro_x, centro_y)
+
+
+def desenhar_cabeca_ombros(frame, head, left_shoulder, right_shoulder, centro, track_id):
+    """
+    Desenha o padrão cabeça + ombros.
+    """
+    hx, hy = head
+    lx, ly = left_shoulder
+    rx, ry = right_shoulder
+    cx, cy = centro
+
+    # Cabeça
+    cv2.circle(frame, (hx, hy), 7, (0, 255, 255), -1)
+
+    # Ombros
+    cv2.circle(frame, (lx, ly), 7, (255, 0, 0), -1)
+    cv2.circle(frame, (rx, ry), 7, (255, 0, 0), -1)
+
+    # Linhas cabeça/ombros
+    cv2.line(frame, (hx, hy), (lx, ly), (0, 255, 0), 2)
+    cv2.line(frame, (hx, hy), (rx, ry), (0, 255, 0), 2)
+    cv2.line(frame, (lx, ly), (rx, ry), (0, 255, 0), 2)
+
+    # Centro usado para saber se está dentro da área
+    cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
+
+    cv2.putText(
+        frame,
+        f"ID {track_id}",
+        (hx + 10, hy - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2
+    )
+
+
+# =====================================================
+# INICIAR MODELO E WEBCAM
+# =====================================================
+model = YOLO(MODEL_NAME)
+
+cap = cv2.VideoCapture(CAMERA_INDEX)
+
+if not cap.isOpened():
+    raise RuntimeError("Nao foi possivel abrir a webcam.")
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+ret, frame = cap.read()
+
+if not ret:
     cap.release()
-    cv2.destroyAllWindows()
-    print(f"Finalizado. Entradas={counter.entries} | Saidas={counter.exits}")
+    raise RuntimeError("Nao foi possivel capturar imagem da webcam.")
 
+h, w = frame.shape[:2]
 
-if __name__ == "__main__":
-    main()
+# =====================================================
+# ÁREA DO AMBIENTE
+# =====================================================
+# Ajuste esta região conforme o ambiente real.
+# Aqui está usando quase a imagem inteira.
+roi_points = np.array([
+    [40, 40],
+    [w - 40, 40],
+    [w - 40, h - 40],
+    [40, h - 40]
+], dtype=np.int32)
+
+# Dicionário dos IDs rastreados.
+# Cada pessoa terá:
+# - presente: True/False
+# - frames_desaparecido: contador para evitar bug de sumiço rápido
+# - ultimo_centro: última posição conhecida
+pessoas = {}
+
+while True:
+    ret, frame = cap.read()
+
+    if not ret:
+        break
+
+    output = frame.copy()
+
+    # Desenhar área do ambiente
+    cv2.polylines(
+        output,
+        [roi_points],
+        isClosed=True,
+        color=(0, 255, 255),
+        thickness=2
+    )
+
+    # =====================================================
+    # DETECÇÃO + RASTREAMENTO COM POSE
+    # =====================================================
+    results = model.track(
+        source=frame,
+        persist=True,
+        conf=CONFIDENCE,
+        tracker="botsort.yaml",
+        verbose=False
+    )
+
+    ids_detectados_agora = set()
+
+    if results and len(results) > 0:
+        result = results[0]
+
+        # Verifica se existem IDs e keypoints
+        if (
+            result.boxes is not None
+            and result.boxes.id is not None
+            and result.keypoints is not None
+        ):
+            track_ids = result.boxes.id.cpu().numpy().astype(int)
+
+            # xy: coordenadas dos keypoints
+            # conf: confiança dos keypoints
+            kpts_xy = result.keypoints.xy.cpu().numpy()
+            kpts_conf = result.keypoints.conf.cpu().numpy()
+
+            for i, track_id in enumerate(track_ids):
+                xy = kpts_xy[i]
+                conf = kpts_conf[i]
+
+                # Junta x, y e confiança em uma matriz [17, 3]
+                kpts = np.concatenate(
+                    [xy, conf.reshape(-1, 1)],
+                    axis=1
+                )
+
+                validacao = validar_formato_cabeca_ombros(kpts)
+
+                if not validacao[0]:
+                    continue
+
+                _, head, left_shoulder, right_shoulder, centro = validacao
+
+                cx, cy = centro
+
+                dentro_roi = cv2.pointPolygonTest(
+                    roi_points,
+                    (cx, cy),
+                    False
+                ) >= 0
+
+                if not dentro_roi:
+                    continue
+
+                ids_detectados_agora.add(track_id)
+
+                # Se é uma pessoa nova, cadastra.
+                if track_id not in pessoas:
+                    pessoas[track_id] = {
+                        "presente": True,
+                        "frames_desaparecido": 0,
+                        "ultimo_centro": centro
+                    }
+                else:
+                    pessoas[track_id]["presente"] = True
+                    pessoas[track_id]["frames_desaparecido"] = 0
+                    pessoas[track_id]["ultimo_centro"] = centro
+
+                desenhar_cabeca_ombros(
+                    output,
+                    head,
+                    left_shoulder,
+                    right_shoulder,
+                    centro,
+                    track_id
+                )
+
+    # =====================================================
+    # CONTROLE CONTRA BUG DE PESSOAS MUITO PRÓXIMAS
+    # =====================================================
+    for track_id in list(pessoas.keys()):
+        if pessoas[track_id]["presente"]:
+            if track_id not in ids_detectados_agora:
+                pessoas[track_id]["frames_desaparecido"] += 1
+
+                # Se sumiu por poucos frames, mantém como presente.
+                if pessoas[track_id]["frames_desaparecido"] <= MAX_FRAMES_DESAPARECIDO:
+                    continue
+
+                # Se sumiu por muitos frames, considera que saiu.
+                pessoas[track_id]["presente"] = False
+
+    total_presentes = sum(
+        1 for dados in pessoas.values()
+        if dados["presente"]
+    )
+
+    # =====================================================
+    # INFORMAÇÕES NA TELA
+    # =====================================================
+    cv2.rectangle(output, (10, 10), (470, 120), (0, 0, 0), -1)
+
+    cv2.putText(
+        output,
+        f"Pessoas no ambiente: {total_presentes}",
+        (25, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.95,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        output,
+        "Validacao: cabeca + ombros",
+        (25, 78),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        output,
+        "Pressione 'q' para sair",
+        (25, 110),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 255),
+        2
+    )
+
+    cv2.imshow(WINDOW_NAME, output)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
